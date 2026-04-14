@@ -127,6 +127,12 @@ class SimpleCPUOffloadScheduler:
         # Inverse map: load_event_idx -> req_ids. Keyed by load_event_idx because
         # the worker reports completions by event index, not request id.
         self._load_event_to_reqs: dict[int, list[str]] = {}
+        # Cache the result of find_longest_cache_hit() from
+        # get_num_new_matched_tokens() so that update_state_after_alloc() can
+        # reuse it without a second lookup.  Blocks are touch()-ed immediately
+        # on first discovery to prevent LRU eviction before the load is set up.
+        # Maps request_id -> (cpu_hit_blocks_by_group, hit_length).
+        self._pending_cpu_hits: dict[str, tuple[list, int]] = {}
 
         # Store metadata
         self._lazy_mode = lazy_offload
@@ -219,11 +225,40 @@ class SimpleCPUOffloadScheduler:
         max_hit_len = request.num_tokens - 1 - num_computed_tokens
         if max_hit_len <= 0:
             return 0, False
-        _, hit_length = self.cpu_coordinator.find_longest_cache_hit(
+        cpu_hit_blocks, hit_length = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
 
         if hit_length > 0:
+            # If a previous scheduling attempt for this request left an
+            # unconsumed pin (e.g. allocate_slots() returned None and the
+            # request was retried), release that stale pin now before
+            # overwriting the entry.  Without this, every failed allocation
+            # permanently increments the ref_cnt of the same blocks, making
+            # them un-evictable and eventually exhausting the CPU block pool.
+            stale = self._pending_cpu_hits.pop(request.request_id, None)
+            if stale is not None:
+                stale_blocks, _ = stale
+                self.cpu_block_pool.free_blocks(
+                    blk
+                    for group_blocks in stale_blocks
+                    for blk in group_blocks
+                    if not blk.is_null
+                )
+
+            # Pin the found CPU blocks immediately so LRU eviction cannot
+            # remove them between now and update_state_after_alloc().  The pin
+            # is released inside update_state_after_alloc() once the persistent
+            # touch() for the async load has been established, or inside
+            # request_finished() if the request is preempted before that.
+            all_hit_blocks = [
+                blk
+                for group_blocks in cpu_hit_blocks
+                for blk in group_blocks
+                if not blk.is_null
+            ]
+            self.cpu_block_pool.touch(all_hit_blocks)
+            self._pending_cpu_hits[request.request_id] = (cpu_hit_blocks, hit_length)
             return hit_length, True
         return 0, False
 
@@ -252,21 +287,53 @@ class SimpleCPUOffloadScheduler:
         if num_external_tokens == 0:
             return
 
+        # Retrieve the CPU blocks that were found (and pinned) by
+        # get_num_new_matched_tokens().  Using the cached result avoids a
+        # second find_longest_cache_hit() call and closes the TOCTOU window
+        # where LRU eviction could remove those blocks between the two calls.
+        pending = self._pending_cpu_hits.pop(req_id, None)
+        if pending is None:
+            # No cached hit for this request — this can happen if
+            # get_num_new_matched_tokens() was never called (e.g. request was
+            # resumed after preemption).  Nothing to load.
+            logger.debug(
+                "CPU offload: no pending CPU hit for request %s "
+                "(num_external_tokens=%d); skipping load.",
+                req_id, num_external_tokens,
+            )
+            return
+
+        cpu_hit_blocks, actual_hit_length = pending
+
+        if actual_hit_length < num_external_tokens:
+            # Defensive: the cached hit length is shorter than expected.
+            # Under normal operation this should not happen because touch()
+            # in get_num_new_matched_tokens() prevents LRU eviction, but
+            # guard against future callers that bypass that path.  Degrade
+            # gracefully rather than crashing the server.
+            logger.warning(
+                "CPU offload: expected %d hit tokens for request %s, "
+                "but cached result has %d tokens; CPU blocks may have been "
+                "evicted concurrently. Loading partial result.",
+                num_external_tokens, req_id, actual_hit_length,
+            )
+            num_external_tokens = actual_hit_length
+            if num_external_tokens == 0:
+                # Release the temporary pin and bail out.
+                all_hit_blocks = [
+                    blk
+                    for group_blocks in cpu_hit_blocks
+                    for blk in group_blocks
+                    if not blk.is_null
+                ]
+                self.cpu_block_pool.free_blocks(all_hit_blocks)
+                return
+
         num_blocks_to_load = num_external_tokens // self.block_size
         assert num_blocks_to_load > 0
 
         skipped = sum(blk.block_hash is not None for blk in blocks.blocks[self.fa_gidx])
         num_computed_tokens = skipped * self.block_size
-        hashes_to_load = request.block_hashes[skipped : skipped + num_blocks_to_load]
-
-        # Find CPU cached blocks across all groups.
-        max_hit_len = len(hashes_to_load) * self.block_size
-        cpu_hit_blocks, hit_length = self.cpu_coordinator.find_longest_cache_hit(
-            hashes_to_load, max_hit_len
-        )
-        assert hit_length == num_external_tokens, (
-            f"Expected {num_external_tokens} hit tokens, got {hit_length}"
-        )
 
         # Build transfer pairs across all groups.
         total_computed_tokens = num_computed_tokens + num_external_tokens
@@ -299,7 +366,18 @@ class SimpleCPUOffloadScheduler:
                 cpu_blocks_to_touch.append(cpu_blk)
 
         # Touch CPU blocks to prevent eviction during async load.
+        # This is the persistent pin that lasts until _cleanup_load_request().
         self.cpu_block_pool.touch(cpu_blocks_to_touch)
+
+        # Release the temporary pin acquired in get_num_new_matched_tokens().
+        # The persistent touch() above now owns the ref, so this balances out.
+        all_hit_blocks = [
+            blk
+            for group_blocks in cpu_hit_blocks
+            for blk in group_blocks
+            if not blk.is_null
+        ]
+        self.cpu_block_pool.free_blocks(all_hit_blocks)
 
         # Touch GPU blocks to prevent freeing during async load
         assert self._gpu_block_pool is not None
@@ -659,6 +737,19 @@ class SimpleCPUOffloadScheduler:
         """Always returns (False, None). GPU blocks are protected by ref_cnt,
         so the scheduler can free blocks immediately."""
         req_id = request.request_id
+
+        # Release any temporary CPU pin from get_num_new_matched_tokens() that
+        # was never consumed by update_state_after_alloc() (e.g. preemption).
+        pending = self._pending_cpu_hits.pop(req_id, None)
+        if pending is not None:
+            cpu_hit_blocks, _ = pending
+            all_hit_blocks = [
+                blk
+                for group_blocks in cpu_hit_blocks
+                for blk in group_blocks
+                if not blk.is_null
+            ]
+            self.cpu_block_pool.free_blocks(all_hit_blocks)
 
         # Handle load: defer cleanup if load is in-flight
         load_state = self._reqs_to_load.get(req_id)
